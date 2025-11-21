@@ -12,12 +12,10 @@ Reference libs / external acceleration:
 - OpenBLAS: https://www.openblas.net/
 
 Key primitives to leverage:
-- `tl.make_block_ptr` – create blocked pointer ensuring locality of BLOCK_SIZE_M x BLOCK_SIZE_N tiles
 - `tl.dot(a, b, out_dtype=..., allow_tf32=...)` – matrix multiply intrinsic lowered through CPU pass pipeline
 
-Demo script: `python/tutorials/cpu-blocked-matmul-aarch64.py`
-- `block_transpose_combined_kernel`: transforms [M, N] -> [M/BM, N/BN, BM, BN] for page/locality friendly block access
-- `matmul_kernel`: computes one output tile `[BLOCK_SIZE_M, BLOCK_SIZE_N]`
+
+# Add rhs pack function support
 
 
 ## packing implementation 
@@ -231,3 +229,93 @@ find python/build -name 'compile_commands.json' | xargs readlink -f
 # example:
 # python/build/cmake.linux-aarch64-cpython-3.12/compile_commands.json
 ```
+
+---
+
+## Detailed: Integrating An External CPU Ukernel (step-by-step)
+
+This guide shows the minimal and recommended steps to add an external ukernel (C/C++ shared library)
+so it can be invoked from Triton JIT-generated CPU kernels. It focuses on Python/frontend/runtime/link-time
+integration first; IR/MLIR lowering is described at a high level and can be implemented after the runtime pieces.
+
+1) Native ukernel: implement & test
+- Implement the ukernel with a stable C ABI (extern "C" if C++). Use only POD types in the API (size_t, void*).
+- Example ABI (adapt to your kernel):
+    ```c
+    extern "C" void kai_run_rhs_pack(size_t num_groups, size_t n, size_t k, size_t nr, size_t kr, size_t sr,
+                                                                        size_t rhs_stride, const void* rhs, const void* bias, const void* scale,
+                                                                        void* rhs_packed, size_t extra_bytes, const void* params);
+    ```
+- Build the shared object and verify it with a small C test program.
+
+2) Add a Python loader (lazy, robust)
+- Create `python/triton/backends/cpu/ukernel_loader.py`:
+    - Use `os.getenv('TRITON_CPU_UKERNEL_SO')` to pick the .so path or fall back to known locations.
+    - Load with `ctypes.CDLL(path)` and `getattr(lib, 'kai_run_rhs_pack')`.
+    - Set `argtypes`/`restype` on the function pointer and wrap pointer arguments as `ctypes.c_void_p`.
+    - Cache the loaded function with `lru_cache`.
+
+3) High-level Python wrapper
+- Implement `run_rhs_pack_external(B, block_k, block_n, bias=None, out=None)` that:
+    - Validates inputs (dtype, contiguity, shape)
+    - Allocates flattened `out` buffer if not provided (K_blocks * N_blocks * block_k * block_n)
+    - Calls the bound C function using raw pointers (`.data_ptr()` → `ctypes.c_void_p`)
+    - Falls back to pure-Python reference `pack.run_rhs_pack` if the loader fails
+
+4) Link-time vs runtime symbol resolution
+- Two main approaches:
+    - Link-time: add the ukernel `.a`/`.o` to the list of libraries used by `cpu_backend.make_so()` so emitted kernels directly link to the symbol. Modify `python/triton/backends/cpu/compiler.py` `make_so()` to add your lib to `_build()` call (libs / lib_dirs).
+    - Runtime-dlopen: `ctypes.CDLL(your_so)` in `driver.py` at process startup so the JITed module resolves the symbol dynamically when executed.
+- Recommendation: link-time integration is cleaner for production; dlopen is easier for experiment/prototyping.
+
+5) Python stub + lowering (emit call in generated code)
+- Add a Python-level stub intrinsic (e.g. `kai_run_rhs_pack_intrin`) in `python/triton/language` or `python/triton/extras` that will be recognized by the AST→TTIR lowering and emitted as an external call. The stub should not run at Python time.
+- Update the AST→TTIR lowering (in `python/triton/compiler/code_generator.py`) to detect calls to that stub and emit a `call_extern` op with the canonical symbol name and arguments. Ensure arguments use the correct pointer/size_t types.
+
+6) Make linking changes in `make_so` (if link-time)
+- Add your lib name/path into the `libs` and `lib_dirs` parameters passed to `_build()` in `python/triton/backends/cpu/compiler.py::make_so` so it is linked into the final `.so` returned to Python.
+
+7) Cache & versioning
+- If the ukernel ABI or presence changes compiled behavior, include a small `TRITON_CPU_UKERNEL_VERSION` or library mtime/hash into the kernel cache key so old artifacts are invalidated appropriately.
+
+8) Tests
+- Unit tests:
+    - `test_pack_external_present`: ensure external .so is loaded and outputs match the Python reference.
+    - `test_pack_external_missing`: ensure fallback path is used or error is clear.
+    - Edge cases: partial-block sizes, empty bias, dtype checks.
+
+9) Example: simple loader (ctypes)
+```python
+import os, ctypes
+from functools import lru_cache
+
+@lru_cache(None)
+def load_kai_pack(path=None):
+        path = path or os.getenv('TRITON_CPU_UKERNEL_SO')
+        if not path:
+                raise FileNotFoundError('TRITON_CPU_UKERNEL_SO not set')
+        lib = ctypes.CDLL(path)
+        fn = getattr(lib, 'kai_run_rhs_pack')
+        # configure argtypes/restype as needed
+        return fn
+```
+
+10) Example: wrapper calling loader
+```python
+def run_rhs_pack_external(B, block_k, block_n, bias=None, out=None):
+        try:
+                fn = load_kai_pack()
+        except Exception:
+                return run_rhs_pack(B, block_k, block_n, bias=bias, out=out)  # fallback
+
+        # prepare pointers and call fn via ctypes
+        # ... validate and convert .data_ptr() to ctypes.c_void_p
+```
+
+11) Debugging tips
+- Use `nm -D libkai_pack.so` to inspect exported symbols.
+- Run a small C test binary that calls the symbol to ensure ABI correctness before integrating with Triton.
+- Enable verbose linking in `make_so` to inspect final link line.
+- Use small sizes + known inputs to compare external vs Python reference outputs.
+
+If you want, I can implement the `ukernel_loader.py` + `run_rhs_pack_external` wrapper and a basic unit test that compares results to the Python packer. Reply which of these you want me to add. 
