@@ -102,7 +102,7 @@ def pack_rhs_kernel_blockptr(rhs_ptr,      # input matrix B base pointer (K, N)
         out_block_base = out_block_index * PACKED_SIZE
 
         #todos: run_rhs_pack
-        rhs_packed = run_rhs_pack(BLOCK_SIZE_K, BLOCK_SIZE_N, rhs_stride, rhs_blk, bias_block, rhs_stride, rhs_blk, bias_block)
+        rhs_packed = run_rhs_pack(rhs_blk, bias_block, rhs_stride, rhs_blk, bias_block)
         tl.store(packed_block_ptr, rhs_packed)
 
         rhs_block_ptr = tl.advance(rhs_block_ptr, 0, BLOCK_SIZE_N) 

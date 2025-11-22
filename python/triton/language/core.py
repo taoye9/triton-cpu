@@ -1807,6 +1807,9 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 # Linear Algebra
 # -----------------------
 
+@builtin
+def pack_rhs(rhs , bias , _builder=None):
+    return semantic.pack_rhs(rhs , bias , _builder)
 
 @builtin
 def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,

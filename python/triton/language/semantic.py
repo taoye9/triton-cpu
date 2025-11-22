@@ -1521,6 +1521,9 @@ def _str_to_dot_input_precision(input_precision, builder):
         input_precision = "TF32x3"
     return getattr(ir.INPUT_PRECISION, input_precision)
 
+def pack_rhs(rhs : tl.tensor, bias : tl.tensor, builder : ir.builder) -> tl.tensor:
+    output_type = tl.uint8
+    return tl.tensor(builder.create_pack_rhs(rhs.handle, bias.handle), output_type)
 
 def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
         out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:

@@ -113,6 +113,7 @@ from .core import (
     view,
     void,
     where,
+    pack_rhs,
 )
 from .math import (umulhi, exp, exp2, fma, log, log2, cos, rsqrt, sin, sqrt, sqrt_rn, abs, fdiv, div_rn, erf, floor,
                    ceil)

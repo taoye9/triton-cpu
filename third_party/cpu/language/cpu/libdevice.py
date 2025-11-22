@@ -3,6 +3,9 @@ from triton.language import core
 from triton.language.core import builtin
 from triton import jit
 
+@core.extern
+def abs(arg0, _builder=None):
+    return core.tensor(_builder.create_abs(arg0.handle), arg0.type)
 
 @core.extern
 def acos(arg0, _builder=None):

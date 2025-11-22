@@ -1822,6 +1822,14 @@ void init_triton_ir(py::module &&m) {
       .def("create_proton_record",
            [](TritonOpBuilder &self, bool isStart, int32_t regionId) -> void {
              self.create<mlir::triton::proton::RecordOp>(isStart, regionId);
+           })
+      .def("create_pack_rhs",
+           [](TritonOpBuilder &self, mlir::Value &rhs,
+              mlir::Value &bias) -> Value {
+             // todo: implement pack rhs op
+             // return packed rhs
+             printf("Warning: pack_rhs is not implemented yet.\n");
+             return rhs;
            });
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
@@ -1896,8 +1904,8 @@ void init_triton_ir(py::module &&m) {
           self.enableCrashReproducerGeneration(reproducerPath,
                                                /*genLocalReproducer=*/true);
         }
-        // TODO: (vectorTransformsOptions in ConvertVectorToLLVMPass not covered
-        // with CLCrashReprodcer) Waiting for LLVM with
+        // TODO: (vectorTransformsOptions in ConvertVectorToLLVMPass not
+        // covered with CLCrashReprodcer) Waiting for LLVM with
         // https://github.com/llvm/llvm-project/pull/128219 Merged
         //
         // } else {
