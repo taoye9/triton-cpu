@@ -17,8 +17,7 @@ Key primitives to leverage:
 
 # Add rhs pack function support
 
-
-## packing implementation 
+## Python interface:
 
 goal is to add packing function which supports the following ukernels defined in https://github.com/ARM-software/kleidiai/blob/main/kai/ukernels/matmul/pack/kai_rhs_pack_kxn_f16p16x1biasf16_f16_f16_neon.h
 
@@ -67,21 +66,21 @@ some helper functions to be used during compile-time (i.e. directly through pyth
 size_t kai_get_rhs_packed_size_rhs_pack_kxn_f16p16x1biasf16_f16_f16_neon(size_t n, size_t k);
 ```
 
-### python interface
+### python interface declaration
 
 our triton kernel packs a partial B matrix tile (tileK x tileN) into a packed format using the above C++ primitive interface.
 ```python
 # example usage
-rhs_packed = run_rhs_pack(BLOCK_SIZE_K, BLOCK_SIZE_N, rhs_stride, rhs_blk, bias_block, rhs_stride, rhs_blk, bias_block)
-
-out: packed_rhs of shape (BLOCK_SIZE_K * BLOCK_SIZE_N + extra_bytes,)
+rhs_packed = run_rhs_pack(rhs_blk, bias_block)
+# out: packed_rhs of shape (BLOCK_SIZE_K * BLOCK_SIZE_N)
 ```
 
-## Triton CPU JIT Compiler (Python Perspective)
+in ir.cc, bind the `create_rhs_pack` to python interface through pybind11. it's a simple wrapper around mlir builder which creates an op. 
 
-Focus: How Python code wraps, compiles, caches, and launches Triton kernels on CPU. (Lower-level MLIR/LLVM passes intentionally omitted.)
+implment python wrapper functions in `core.py` and `semantics.py` to call the above C++ primitive through triton cpu backend.
 
-### Python-Level Flow (Source Function → Launched Kernel)
+
+### Code generation: From python AST to mlir TTIR
 1. Decorate with `@triton.jit`: a `JITFunction` object captures the Python function, its signature, and constexpr annotations.
 2. Indexing `fn[grid]` calls `JITFunction.__getitem__` returning a lightweight callable that stores the launch `grid`.
 3. Calling that callable collects runtime args + keyword launch options (e.g. `num_threads`) and invokes `JITFunction.run`.
@@ -91,70 +90,31 @@ Focus: How Python code wraps, compiles, caches, and launches Triton kernels on C
 
 Result: Python invocation reuses cached native code, minimizing recompilation and providing a simple `kernel[grid](...)` API.
 
-### Key Python Modules
-- `python/triton/jit.py` (via `@triton.jit`): Wraps user function, implements `__getitem__`, caching logic, and argument marshalling.
-- `python/triton/compiler/compiler.py`: Orchestrates compilation stages and caching (abstracts away IR specifics here).
-- `python/triton/backends/cpu/compiler.py`: Backend interface exposed to Python; defines `CPUOptions` parsing and final artifact production.
-- `python/triton/backends/cpu/driver.py`: Generates/compiles a small C++ launcher module; exposes a Python-callable `launch` function.
+question:  tensor class methods are stub or placeholder with ... (an ellipsis literal). there are mutiple implementation. 
+how are they binded during compile?
+  -	Stub files (.pyi files), where the implementation exists elsewhere (e.g., in C/C++ extensions or other Python modules).
+	-	Generated interfaces for native bindings (e.g., functions implemented in C/C++ via CPython API, cython, pybind11, etc.).
 
-### CPUOptions (Runtime Launch Configuration)
-Defined as a dataclass in `cpu/compiler.py` and parsed by `CPUBackend.parse_options`:
-- `num_threads`: Requested max threads; 0 means use all available cores.
-- `vec_lib`: Name of optional vector math library (string mapped to enum later).
-- `ukernels`: Micro-kernel provider (e.g. OneDNN/XSMM); may be disabled if library not present.
-- `enable_fast_math`: Influences math lowering decisions (abstracted here).
-All fields contribute to the options hash used in the kernel cache key.
+## MLIR Lowering
 
-### Caching Mechanics (Simplified)
-- Cache key components: function source digest + constexpr dict + options hash.
-- On miss: build IR + native code, instantiate launcher, store `CompiledKernel`.
-- On hit: reuse existing `CompiledKernel` without regenerating native artifacts.
-- Environment knobs (Python-visible):
-    - `TRITON_HOME`: Cache location base (`$TRITON_HOME/.triton`).
-    - `MAX_JOBS`: Influences parallel build resource usage during initial native compilation.
-    - `TRITON_CPU_UKERNELS_LIB`: Select micro-kernel provider (affects performance characteristics).
+### MLIR Ops: 
 
-### Launch Semantics in Practice
-```python
-@triton.jit
-def matmul_kernel(a, b, c, M, N, K,
-                                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                    OUT_DTYPE: tl.constexpr):
-        # body omitted for brevity
-        ...
+#### concepts:
 
-grid = ( (M + BLOCK_M - 1)//BLOCK_M ) * ( (N + BLOCK_N - 1)//BLOCK_N )
-matmul_kernel[grid](a, b, c, M, N, K, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, OUT_DTYPE=tl.float32, num_threads=8)
-```
-Steps performed:
-1. `__getitem__` stores `grid`.
-2. Call collects args; `num_threads=8` joins other kwargs.
-3. Options parsed → `CPUOptions` (with `num_threads=8`).
-4. Cache lookup → compile if needed → obtain launcher.
-5. Launcher executes kernel body across grid indices using OpenMP with up to 8 threads.
+MLIR Op = Traits + Interfaces + Attributes + Regions + Types + Semantics
 
-### Driver (Runtime Glue) Overview
-`driver.py` dynamically builds a tiny C++ module (includes runtime headers) that:
-- Flattens the 3D grid to a linear range.
-- Sets OpenMP thread count from metadata / `num_threads`.
-- Performs per-program-id offset calculations before calling the compiled kernel function pointer.
-Returned Python object exposes `launch(args...)` used transparently by the JIT wrapper.
+An MLIR operation (func.func, arith.addi, your custom op) is described by:
+    -   Traits → opt-in compile-time behavior (“this op has X property”).
+        - used in verification, transformations, pattern matching.
+        - You cannot configure traits at runtime. They are part of the op class, not the op instance.
+            - `if (op->hasTrait<OpTrait::ConstantLike>()) { ... }`
+    -   Interfaces → virtual API that passes/rewriters can use generically
+    -   Attributes → user-specified metadata stored directly on the op
+    -   Operands → SSA inputs
+    -   Results → SSA outputs
+    -   Regions / blocks → structure
+    -   Verifier + semantic rules
 
-### Extending From Python
-To add new launch options or behaviors:
-1. Extend `CPUOptions` dataclass (ensure new field participates in `.hash()`).
-2. Accept the kwarg in your kernel call; `parse_options` will capture it.
-3. If it affects runtime only (not codegen), plumb through launcher metadata and adjust C++ template in `driver.py`.
-
-### Why This Abstraction Matters
-- Keeps user API simple: grid + args + optional tuning knobs.
-- Separates tuning (threads, micro-kernel choice) from algorithmic Python code.
-- Enables rapid iteration: small Python changes only recompile when cache key changes.
-- Avoids exposing internal IR/pass complexity to end users focusing on Python.
-
-# triton language 
-
-Triton is a DSL embedded in Python, but it uses syntactic interception, not runtime polymorphism. @triton.jit intercepts the code and converted it to AST for further compilation.
 
 # Environment Setup
 
@@ -223,6 +183,8 @@ Notes:
     ```
 
 ### Code Intelligence
+
+- c++ code:
 Provide the absolute path to `compile_commands.json` in C/C++ configuration for proper symbol navigation.
 ```bash
 find python/build -name 'compile_commands.json' | xargs readlink -f
@@ -230,92 +192,78 @@ find python/build -name 'compile_commands.json' | xargs readlink -f
 # python/build/cmake.linux-aarch64-cpython-3.12/compile_commands.json
 ```
 
----
+- **MLIR code:**
 
-## Detailed: Integrating An External CPU Ukernel (step-by-step)
+VS Code MLIR settings requires point the MLIR language servers to the correct TableGen server binary with proper include paths.
 
-This guide shows the minimal and recommended steps to add an external ukernel (C/C++ shared library)
-so it can be invoked from Triton JIT-generated CPU kernels. It focuses on Python/frontend/runtime/link-time
-integration first; IR/MLIR lowering is described at a high level and can be implemented after the runtime pieces.
+```bash
+# find the tablegen compilation database
+find . -type f -name 'tablegen_compile_commands.yml'
 
-1) Native ukernel: implement & test
-- Implement the ukernel with a stable C ABI (extern "C" if C++). Use only POD types in the API (size_t, void*).
-- Example ABI (adapt to your kernel):
-    ```c
-    extern "C" void kai_run_rhs_pack(size_t num_groups, size_t n, size_t k, size_t nr, size_t kr, size_t sr,
-                                                                        size_t rhs_stride, const void* rhs, const void* bias, const void* scale,
-                                                                        void* rhs_packed, size_t extra_bytes, const void* params);
+# find MLIR/TableGen LSP server binaries
+find . -type f -executable \( -name 'mlir-lsp-server' -o -name 'mlir-pdll-lsp-server' -o -name 'tblgen-lsp-server' \)
+```
+
+in `.vscode/settings.json`, add the above abs path in following setting (adjust the path as necessary):
+
+```json
+{
+    "mlir.onSettingsChanged": "restart",
+    "mlir.server_path": "...",
+    "mlir.pdll_server_path": ...",
+    "mlir.tablegen_server_path": "...",
+    "mlir.tablegen_compilation_databases": [
+        "..."
+    ],
+}
+```
+
+- MLIR tools:
+utiles mlir-opt, mlir-translate, etc. from the build. Add the build bin dir to PATH in terminal env settings.
+
+```json
+{
+  "terminal.integrated.env.linux": {
+    "PATH": "${workspaceFolder}/triton-cpu/python/build/cmake.linux-aarch64-cpython-3.12/bin/:${env:PATH}"
+  }
+}
+```
+
+- **View generated MLIR code:**
+
+add vscode settings to enable MLIR generated c++ code (suffix with .inc)syntax highlighting and code navigation.
+```json
+{
+"C_Cpp.dimInactiveRegions": false
+}
+```
+
+# Code structure overview
+
+## MLIR triton dialect
+
+### traits
+
+How the Triton dialect defines and organizes its custom traits:
+
+1. **TableGen definitions (`.td`)**  
+   Custom Triton traits are defined in  
+   `include/triton/Dialect/Triton/IR/TritonInterfaces.td`  
+   as subclasses of `NativeOpTrait` and `NativeTrait` are MLIR meta-constructs that wrap C++ traits so they can be attached to ops via TableGen.
+    All op traits ultimately derive from `Trait` in `mlir/IR/Traits.td`, which corresponds to `TraitBase` in the C++ side (`mlir/IR/OpDefinition.h`).
+
+2. **C++ trait implementations**  
+   Declared in `include/triton/Dialect/Triton/IR/Traits.h`, where each Triton trait is a subclass of `TraitBase` following this standard MLIR pattern:
+   ```cpp
+   template <typename ConcreteType>
+   class TraitsName : public TraitBase<ConcreteType, TraitsName> {
+   public:
+     static LogicalResult verifyTrait(Operation *op) {
+       return impl::verifyHelperFunc(op, ...);
+     }
+   };
     ```
-- Build the shared object and verify it with a small C test program.
-
-2) Add a Python loader (lazy, robust)
-- Create `python/triton/backends/cpu/ukernel_loader.py`:
-    - Use `os.getenv('TRITON_CPU_UKERNEL_SO')` to pick the .so path or fall back to known locations.
-    - Load with `ctypes.CDLL(path)` and `getattr(lib, 'kai_run_rhs_pack')`.
-    - Set `argtypes`/`restype` on the function pointer and wrap pointer arguments as `ctypes.c_void_p`.
-    - Cache the loaded function with `lru_cache`.
-
-3) High-level Python wrapper
-- Implement `run_rhs_pack_external(B, block_k, block_n, bias=None, out=None)` that:
-    - Validates inputs (dtype, contiguity, shape)
-    - Allocates flattened `out` buffer if not provided (K_blocks * N_blocks * block_k * block_n)
-    - Calls the bound C function using raw pointers (`.data_ptr()` → `ctypes.c_void_p`)
-    - Falls back to pure-Python reference `pack.run_rhs_pack` if the loader fails
-
-4) Link-time vs runtime symbol resolution
-- Two main approaches:
-    - Link-time: add the ukernel `.a`/`.o` to the list of libraries used by `cpu_backend.make_so()` so emitted kernels directly link to the symbol. Modify `python/triton/backends/cpu/compiler.py` `make_so()` to add your lib to `_build()` call (libs / lib_dirs).
-    - Runtime-dlopen: `ctypes.CDLL(your_so)` in `driver.py` at process startup so the JITed module resolves the symbol dynamically when executed.
-- Recommendation: link-time integration is cleaner for production; dlopen is easier for experiment/prototyping.
-
-5) Python stub + lowering (emit call in generated code)
-- Add a Python-level stub intrinsic (e.g. `kai_run_rhs_pack_intrin`) in `python/triton/language` or `python/triton/extras` that will be recognized by the AST→TTIR lowering and emitted as an external call. The stub should not run at Python time.
-- Update the AST→TTIR lowering (in `python/triton/compiler/code_generator.py`) to detect calls to that stub and emit a `call_extern` op with the canonical symbol name and arguments. Ensure arguments use the correct pointer/size_t types.
-
-6) Make linking changes in `make_so` (if link-time)
-- Add your lib name/path into the `libs` and `lib_dirs` parameters passed to `_build()` in `python/triton/backends/cpu/compiler.py::make_so` so it is linked into the final `.so` returned to Python.
-
-7) Cache & versioning
-- If the ukernel ABI or presence changes compiled behavior, include a small `TRITON_CPU_UKERNEL_VERSION` or library mtime/hash into the kernel cache key so old artifacts are invalidated appropriately.
-
-8) Tests
-- Unit tests:
-    - `test_pack_external_present`: ensure external .so is loaded and outputs match the Python reference.
-    - `test_pack_external_missing`: ensure fallback path is used or error is clear.
-    - Edge cases: partial-block sizes, empty bias, dtype checks.
-
-9) Example: simple loader (ctypes)
-```python
-import os, ctypes
-from functools import lru_cache
-
-@lru_cache(None)
-def load_kai_pack(path=None):
-        path = path or os.getenv('TRITON_CPU_UKERNEL_SO')
-        if not path:
-                raise FileNotFoundError('TRITON_CPU_UKERNEL_SO not set')
-        lib = ctypes.CDLL(path)
-        fn = getattr(lib, 'kai_run_rhs_pack')
-        # configure argtypes/restype as needed
-        return fn
-```
-
-10) Example: wrapper calling loader
-```python
-def run_rhs_pack_external(B, block_k, block_n, bias=None, out=None):
-        try:
-                fn = load_kai_pack()
-        except Exception:
-                return run_rhs_pack(B, block_k, block_n, bias=bias, out=out)  # fallback
-
-        # prepare pointers and call fn via ctypes
-        # ... validate and convert .data_ptr() to ctypes.c_void_p
-```
-
-11) Debugging tips
-- Use `nm -D libkai_pack.so` to inspect exported symbols.
-- Run a small C test binary that calls the symbol to ensure ABI correctness before integrating with Triton.
-- Enable verbose linking in `make_so` to inspect final link line.
-- Use small sizes + known inputs to compare external vs Python reference outputs.
-
-If you want, I can implement the `ukernel_loader.py` + `run_rhs_pack_external` wrapper and a basic unit test that compares results to the Python packer. Reply which of these you want me to add. 
+3.	**Verification logic**
+The actual verification functions in impl namespace are implemented in
+`lib/Dialect/Triton/IR/Traits.cpp`.
+The trait’s verifyTrait forwards to these helper functions.
